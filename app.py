@@ -146,7 +146,7 @@ def predict_delay(month, day_of_month, day_of_week,
         "crs_elapsed_time": [crs_elapsed_time],
         "distance": [distance]
     })
-
+ # Passes the selected flight details through the trained pipeline to predict delay.
     prediction = classifier.predict(input_data)
 
     label = "Delayed" if prediction[0] == 1 else "On Time"
