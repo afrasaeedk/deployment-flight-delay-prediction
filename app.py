@@ -1,8 +1,9 @@
+
 import streamlit as st
 import joblib
 import pandas as pd
+import math
 from datetime import time
-
 
 # --------------------------------------------------
 # PAGE CONFIGURATION
@@ -31,7 +32,10 @@ try:
 except ImportError:
     airport_database = {}
 
-# Fallback airport names
+# --------------------------------------------------
+# AIRPORT AND AIRLINE NAMES
+# --------------------------------------------------
+
 airport_names = {
     "ABE": "Lehigh Valley International Airport",
     "ATL": "Hartsfield-Jackson Atlanta International Airport",
@@ -82,10 +86,6 @@ airport_names = {
     "TPA": "Tampa International Airport"
 }
 
-# --------------------------------------------------
-# AIRLINE NAMES
-# --------------------------------------------------
-
 carrier_names = {
     "9E": "Endeavor Air",
     "AA": "American Airlines",
@@ -109,30 +109,147 @@ carrier_names = {
 # --------------------------------------------------
 
 def format_airport(code):
-
     airport = airport_database.get(code)
 
     if airport:
-        return airport["name"]
+        return airport.get("name", airport_names.get(code, code))
 
     return airport_names.get(code, code)
 
 
 def format_carrier(code):
-
     name = carrier_names.get(code, "Other Airline")
-
     return f"{name} ({code})"
+
+
+# --------------------------------------------------
+# AIRPORT COORDINATES AND DISTANCE
+# --------------------------------------------------
+
+def get_airport_coordinates(code):
+    airport = airport_database.get(code)
+
+    if not airport:
+        return None
+
+    latitude = airport.get("lat")
+    longitude = airport.get("lon")
+
+    if latitude is None or longitude is None:
+        return None
+
+    return float(latitude), float(longitude)
+
+
+def calculate_distance(origin, destination):
+    """Calculate great-circle distance between airports in miles."""
+
+    origin_coordinates = get_airport_coordinates(origin)
+    destination_coordinates = get_airport_coordinates(destination)
+
+    if origin_coordinates is None or destination_coordinates is None:
+        return float("nan")
+
+    lat1, lon1 = map(math.radians, origin_coordinates)
+    lat2, lon2 = map(math.radians, destination_coordinates)
+
+    delta_lat = lat2 - lat1
+    delta_lon = lon2 - lon1
+
+    # Haversine formula
+    a = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2)
+        * math.sin(delta_lon / 2) ** 2
+    )
+
+    central_angle = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    earth_radius_miles = 3958.7613
+
+    return earth_radius_miles * central_angle
+
+
+# --------------------------------------------------
+# ESTIMATE TYPICAL FLIGHT SPEED
+# --------------------------------------------------
+
+valid_speed_rows = df[
+    df["distance"].notna()
+    & df["crs_elapsed_time"].notna()
+    & (df["distance"] > 0)
+    & (df["crs_elapsed_time"] > 0)
+].copy()
+
+valid_speed_rows["speed_mph"] = (
+    valid_speed_rows["distance"]
+    / (valid_speed_rows["crs_elapsed_time"] / 60)
+)
+
+valid_speed_rows = valid_speed_rows[
+    valid_speed_rows["speed_mph"].between(150, 700)
+]
+
+if not valid_speed_rows.empty:
+    typical_speed_mph = float(
+        valid_speed_rows["speed_mph"].median()
+    )
+else:
+    typical_speed_mph = 450.0
+
+
+# --------------------------------------------------
+# ESTIMATE FLIGHT DURATION
+# --------------------------------------------------
+
+def estimate_duration(origin, destination, carrier, distance):
+
+    # First: use historical duration for the selected airline and route.
+    carrier_route = df[
+        (df["origin"] == origin)
+        & (df["dest"] == destination)
+        & (df["op_unique_carrier"] == carrier)
+    ]["crs_elapsed_time"].dropna()
+
+    if not carrier_route.empty:
+        return float(carrier_route.median())
+
+    # Second: use historical duration for the route across airlines.
+    route_duration = df[
+        (df["origin"] == origin)
+        & (df["dest"] == destination)
+    ]["crs_elapsed_time"].dropna()
+
+    if not route_duration.empty:
+        return float(route_duration.median())
+
+    # Third: estimate duration using calculated distance.
+    if pd.notna(distance) and distance > 0:
+        estimated_minutes = (
+            distance / typical_speed_mph
+        ) * 60
+
+        return float(estimated_minutes)
+
+    return float("nan")
 
 
 # --------------------------------------------------
 # PREDICTION FUNCTION
 # --------------------------------------------------
 
-def predict_delay(month, day_of_month, day_of_week,
-                  carrier, origin, dest,
-                  crs_dep_time, crs_arr_time,
-                  crs_elapsed_time, distance):
+def predict_delay(
+    month,
+    day_of_month,
+    day_of_week,
+    carrier,
+    origin,
+    dest,
+    crs_dep_time,
+    crs_arr_time,
+    crs_elapsed_time,
+    distance
+):
 
     input_data = pd.DataFrame({
         "month": [month],
@@ -146,12 +263,13 @@ def predict_delay(month, day_of_month, day_of_week,
         "crs_elapsed_time": [crs_elapsed_time],
         "distance": [distance]
     })
- # Passes the selected flight details through the trained pipeline to predict delay.
+
+    # The trained pipeline handles missing numerical values
+    # and previously unseen categorical values.
+
     prediction = classifier.predict(input_data)
 
-    label = "Delayed" if prediction[0] == 1 else "On Time"
-
-    return label
+    return "Delayed" if prediction[0] == 1 else "On Time"
 
 
 # --------------------------------------------------
@@ -287,15 +405,22 @@ def main():
         key=format_carrier
     )
 
-    # AIRPORTS - ALPHABETICAL ORDER BY AIRPORT NAME
+    # AIRPORTS - INCLUDE AIRPORTS OUTSIDE THE DATASET
 
-    airports = sorted(
+    dataset_airports = (
         set(df["origin"].dropna().unique())
-        | set(df["dest"].dropna().unique()),
-        key=format_airport
+        | set(df["dest"].dropna().unique())
     )
 
-    # OPERATING AIRLINE
+    airports_with_coordinates = {
+        code for code in airport_database
+        if get_airport_coordinates(code) is not None
+    }
+
+    airports = sorted(
+        dataset_airports | airports_with_coordinates,
+        key=format_airport
+    )
 
     carrier = st.selectbox(
         "Operating Airline",
@@ -308,7 +433,6 @@ def main():
     col1, col2 = st.columns(2)
 
     with col1:
-
         origin = st.selectbox(
             "Departure Airport",
             airports,
@@ -316,7 +440,6 @@ def main():
         )
 
     with col2:
-
         dest = st.selectbox(
             "Destination Airport",
             airports,
@@ -329,12 +452,11 @@ def main():
         "Scheduled Departure Date"
     )
 
-    # DEPARTURE AND ARRIVAL TIMES SIDE BY SIDE
+    # DEPARTURE AND ARRIVAL TIMES
 
     time_col1, time_col2 = st.columns(2)
 
     with time_col1:
-
         departure_time = st.time_input(
             "Scheduled Departure Time",
             value=time(9, 0),
@@ -342,7 +464,6 @@ def main():
         )
 
     with time_col2:
-
         arrival_time = st.time_input(
             "Scheduled Arrival Time",
             value=time(12, 0),
@@ -353,29 +474,14 @@ def main():
     # AUTOMATIC DISTANCE AND DURATION
     # --------------------------------------------------
 
-    distance = (
-        df[
-            (df["origin"] == origin) &
-            (df["dest"] == dest)
-        ]["distance"].median()
+    distance = calculate_distance(origin, dest)
+
+    duration = estimate_duration(
+        origin,
+        dest,
+        carrier,
+        distance
     )
-
-    duration = (
-        df[
-            (df["origin"] == origin) &
-            (df["dest"] == dest) &
-            (df["op_unique_carrier"] == carrier)
-        ]["crs_elapsed_time"].median()
-    )
-
-    if pd.isna(duration):
-
-        duration = (
-            df[
-                (df["origin"] == origin) &
-                (df["dest"] == dest)
-            ]["crs_elapsed_time"].median()
-        )
 
     # --------------------------------------------------
     # FLIGHT SUMMARY CARDS
@@ -408,8 +514,9 @@ def main():
     )
 
     st.caption(
-        "Distance and duration are estimated using historical "
-        "flight records."
+        "Distance is calculated from airport coordinates. "
+        "Duration uses historical route information when available, "
+        "or is estimated from distance and typical flight speed."
     )
 
     # --------------------------------------------------
@@ -438,16 +545,15 @@ def main():
         elif pd.isna(distance) or pd.isna(duration):
 
             st.error(
-                "Historical information is unavailable for this route."
+                "Airport location information is unavailable for one "
+                "of the selected airports, so the route distance "
+                "cannot be calculated."
             )
 
         else:
 
             month = departure_date.month
             day_of_month = departure_date.day
-
-            # Monday = 1, Sunday = 7
-
             day_of_week = departure_date.isoweekday()
 
             # CONVERT TIME TO HHMM FORMAT
@@ -502,8 +608,9 @@ def main():
                 )
 
             st.caption(
-                "Predictions are based on historical flight data. "
-                "Actual arrival conditions may differ."
+                "Predictions are based on patterns learned from "
+                "historical flight data. Actual arrival conditions "
+                "may differ."
             )
 
     # --------------------------------------------------
